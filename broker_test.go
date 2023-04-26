@@ -2,6 +2,7 @@ package sarama
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -437,6 +438,138 @@ func TestSASLSCRAMSHAXXX(t *testing.T) {
 			conf.Net.SASL.Password = "pass"
 			conf.Net.SASL.Enable = true
 			conf.Net.SASL.SCRAMClientGeneratorFunc = func() SCRAMClient { return test.scramClient }
+			conf.Version = V1_0_0_0
+
+			err := broker.Open(conf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = broker.Close() })
+
+			_, err = broker.Connected()
+
+			if !errors.Is(test.mockSASLAuthErr, ErrNoError) {
+				if !errors.Is(err, test.mockSASLAuthErr) {
+					t.Errorf("[%d]:[%s] Expected %s SASL authentication error, got %s\n", i, test.name, test.mockHandshakeErr, err)
+				}
+			} else if !errors.Is(test.mockHandshakeErr, ErrNoError) {
+				if !errors.Is(err, test.mockHandshakeErr) {
+					t.Errorf("[%d]:[%s] Expected %s handshake error, got %s\n", i, test.name, test.mockHandshakeErr, err)
+				}
+			} else if test.expectClientErr && err == nil {
+				t.Errorf("[%d]:[%s] Expected a client error and got none\n", i, test.name)
+			} else if !test.expectClientErr && err != nil {
+				t.Errorf("[%d]:[%s] Unexpected error, got %s\n", i, test.name, err)
+			}
+
+			mockBroker.Close()
+		})
+	}
+}
+
+// A mock scram client.
+type MockSCRAMClientWithContext struct {
+	done bool
+}
+
+func (m *MockSCRAMClientWithContext) Begin(_ context.Context, _, _, _ string) (err error) {
+	return nil
+}
+
+func (m *MockSCRAMClientWithContext) Step(_ context.Context, challenge string) (response string, err error) {
+	if challenge == "" {
+		return "ping", nil
+	}
+	if challenge == "pong" {
+		m.done = true
+		return "", nil
+	}
+	return "", errors.New("failed to authenticate :(")
+}
+
+func (m *MockSCRAMClientWithContext) Done(context.Context) bool {
+	return m.done
+}
+
+var _ SCRAMClientWithContext = (*MockSCRAMClientWithContext)(nil)
+
+func TestSASLSCRAMWithContextSHAXXX(t *testing.T) {
+	testTable := []struct {
+		name               string
+		mockHandshakeErr   KError
+		mockSASLAuthErr    KError
+		expectClientErr    bool
+		scramClient        *MockSCRAMClientWithContext
+		scramChallengeResp string
+	}{
+		{
+			name:               "SASL/SCRAMSHAWithContextXXX successful authentication",
+			mockHandshakeErr:   ErrNoError,
+			scramClient:        &MockSCRAMClientWithContext{},
+			scramChallengeResp: "pong",
+		},
+		{
+			name:               "SASL/SCRAMSHAWithContextXXX SCRAM client step error client",
+			mockHandshakeErr:   ErrNoError,
+			mockSASLAuthErr:    ErrNoError,
+			scramClient:        &MockSCRAMClientWithContext{},
+			scramChallengeResp: "gong",
+			expectClientErr:    true,
+		},
+		{
+			name:               "SASL/SCRAMSHAWithContextXXX server authentication error",
+			mockHandshakeErr:   ErrNoError,
+			mockSASLAuthErr:    ErrSASLAuthenticationFailed,
+			scramClient:        &MockSCRAMClientWithContext{},
+			scramChallengeResp: "pong",
+		},
+		{
+			name:               "SASL/SCRAMSHAWithContextXXX unsupported SCRAM mechanism",
+			mockHandshakeErr:   ErrUnsupportedSASLMechanism,
+			mockSASLAuthErr:    ErrNoError,
+			scramClient:        &MockSCRAMClientWithContext{},
+			scramChallengeResp: "pong",
+		},
+	}
+
+	for i, test := range testTable {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			// mockBroker mocks underlying network logic and broker responses
+			mockBroker := NewMockBroker(t, 0)
+			broker := NewBroker(mockBroker.Addr())
+			// broker executes SASL requests against mockBroker
+			broker.requestRate = metrics.NilMeter{}
+			broker.outgoingByteRate = metrics.NilMeter{}
+			broker.incomingByteRate = metrics.NilMeter{}
+			broker.requestSize = metrics.NilHistogram{}
+			broker.responseSize = metrics.NilHistogram{}
+			broker.responseRate = metrics.NilMeter{}
+			broker.requestLatency = metrics.NilHistogram{}
+			broker.requestsInFlight = metrics.NilCounter{}
+
+			mockSASLAuthResponse := NewMockSaslAuthenticateResponse(t).SetAuthBytes([]byte(test.scramChallengeResp))
+			mockSASLHandshakeResponse := NewMockSaslHandshakeResponse(t).SetEnabledMechanisms([]string{SASLTypeSCRAMSHA256, SASLTypeSCRAMSHA512})
+
+			if !errors.Is(test.mockSASLAuthErr, ErrNoError) {
+				mockSASLAuthResponse = mockSASLAuthResponse.SetError(test.mockSASLAuthErr)
+			}
+			if !errors.Is(test.mockHandshakeErr, ErrNoError) {
+				mockSASLHandshakeResponse = mockSASLHandshakeResponse.SetError(test.mockHandshakeErr)
+			}
+
+			mockBroker.SetHandlerByMap(map[string]MockResponse{
+				"SaslAuthenticateRequest": mockSASLAuthResponse,
+				"SaslHandshakeRequest":    mockSASLHandshakeResponse,
+			})
+
+			conf := NewTestConfig()
+			conf.Net.SASL.Mechanism = SASLTypeSCRAMSHA512
+			conf.Net.SASL.Version = SASLHandshakeV1
+			conf.Net.SASL.User = "user"
+			conf.Net.SASL.Password = "pass"
+			conf.Net.SASL.Enable = true
+			conf.Net.SASL.SCRAMClientWithContextGeneratorFunc = func() SCRAMClientWithContext { return test.scramClient }
 			conf.Version = V1_0_0_0
 
 			err := broker.Open(conf)

@@ -1,6 +1,7 @@
 package sarama
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -111,6 +112,8 @@ type AccessTokenProvider interface {
 
 // SCRAMClient is a an interface to a SCRAM
 // client implementation.
+//
+// Derepcated: Use SCRAMClientWithContext instead.
 type SCRAMClient interface {
 	// Begin prepares the client for the SCRAM exchange
 	// with the server with a user name and a password
@@ -121,6 +124,62 @@ type SCRAMClient interface {
 	// Done should return true when the SCRAM conversation
 	// is over.
 	Done() bool
+}
+
+// SCRAMClientWithContext is a an interface to a SCRAM
+// client implementation.
+type SCRAMClientWithContext interface {
+	// Begin prepares the client for the SCRAM exchange
+	// with the server with a user name and a password
+	Begin(ctx context.Context, userName, password, authzID string) error
+	// Step steps client through the SCRAM exchange. It is
+	// called repeatedly until it errors or `Done` returns true.
+	Step(ctx context.Context, challenge string) (response string, err error)
+	// Done should return true when the SCRAM conversation
+	// is over.
+	Done(ctx context.Context) bool
+}
+
+type scramClientWithContextWrapper struct {
+	client SCRAMClient
+}
+
+var _ (SCRAMClientWithContext) = (*scramClientWithContextWrapper)(nil)
+
+func (w *scramClientWithContextWrapper) Begin(
+	_ context.Context, userName, password, authzID string,
+) error {
+	return w.client.Begin(userName, password, authzID)
+}
+
+func (w *scramClientWithContextWrapper) Step(
+	_ context.Context, challenge string,
+) (response string, err error) {
+	return w.client.Step(challenge)
+}
+
+func (w *scramClientWithContextWrapper) Done(_ context.Context) bool {
+	return w.client.Done()
+}
+
+type saslMetadataCtxKey struct{}
+
+// SASLMetadata contains additional data for performing SASL authentication.
+type SASLMetadata struct {
+	// Addr is the address of the broker the authentication will be
+	// performed on.
+	Addr string
+}
+
+// WithSASLMetadata returns a copy of the context with associated SASLMetadata.
+func WithSASLMetadata(ctx context.Context, m *SASLMetadata) context.Context {
+	return context.WithValue(ctx, saslMetadataCtxKey{}, m)
+}
+
+// SASLMetadataFromContext retrieves the SASLMetadata from the context.
+func SASLMetadataFromContext(ctx context.Context) *SASLMetadata {
+	m, _ := ctx.Value(saslMetadataCtxKey{}).(*SASLMetadata)
+	return m
 }
 
 type responsePromise struct {
@@ -1186,7 +1245,11 @@ func (b *Broker) authenticateViaSASLv0() error {
 	case SASLTypeGSSAPI:
 		return b.sendAndReceiveKerberos()
 	default:
-		return b.sendAndReceiveSASLPlainAuthV0()
+		if b.conf.Net.SASL.SCRAMClientWithContextGeneratorFunc != nil {
+			return b.sendAndReceiveSASLSCRAMv0()
+		} else {
+			return b.sendAndReceiveSASLPlainAuthV0()
+		}
 	}
 }
 
@@ -1245,9 +1308,17 @@ func (b *Broker) authenticateViaSASLv1() error {
 		provider := b.conf.Net.SASL.TokenProvider
 		return b.sendAndReceiveSASLOAuth(authSendReceiver, provider)
 	case SASLTypeSCRAMSHA256, SASLTypeSCRAMSHA512:
-		return b.sendAndReceiveSASLSCRAMv1(authSendReceiver, b.conf.Net.SASL.SCRAMClientGeneratorFunc())
+		return b.sendAndReceiveSASLSCRAMv1(
+			authSendReceiver, b.conf.Net.SASL.SCRAMClientWithContextGeneratorFunc(),
+		)
 	default:
-		return b.sendAndReceiveSASLPlainAuthV1(authSendReceiver)
+		if b.conf.Net.SASL.SCRAMClientWithContextGeneratorFunc != nil {
+			return b.sendAndReceiveSASLSCRAMv1(
+				authSendReceiver, b.conf.Net.SASL.SCRAMClientWithContextGeneratorFunc(),
+			)
+		} else {
+			return b.sendAndReceiveSASLPlainAuthV1(authSendReceiver)
+		}
 	}
 }
 
@@ -1424,17 +1495,18 @@ func (b *Broker) sendAndReceiveSASLSCRAMv0() error {
 		return err
 	}
 
-	scramClient := b.conf.Net.SASL.SCRAMClientGeneratorFunc()
-	if err := scramClient.Begin(b.conf.Net.SASL.User, b.conf.Net.SASL.Password, b.conf.Net.SASL.SCRAMAuthzID); err != nil {
+	ctx := WithSASLMetadata(context.Background(), &SASLMetadata{Addr: b.addr})
+	scramClient := b.conf.Net.SASL.SCRAMClientWithContextGeneratorFunc()
+	if err := scramClient.Begin(ctx, b.conf.Net.SASL.User, b.conf.Net.SASL.Password, b.conf.Net.SASL.SCRAMAuthzID); err != nil {
 		return fmt.Errorf("failed to start SCRAM exchange with the server: %w", err)
 	}
 
-	msg, err := scramClient.Step("")
+	msg, err := scramClient.Step(ctx, "")
 	if err != nil {
 		return fmt.Errorf("failed to advance the SCRAM exchange: %w", err)
 	}
 
-	for !scramClient.Done() {
+	for !scramClient.Done(ctx) {
 		requestTime := time.Now()
 		// Will be decremented in updateIncomingCommunicationMetrics (except error)
 		b.addRequestInFlightMetrics(1)
@@ -1465,7 +1537,7 @@ func (b *Broker) sendAndReceiveSASLSCRAMv0() error {
 			return err
 		}
 		b.updateIncomingCommunicationMetrics(n+4, time.Since(requestTime))
-		msg, err = scramClient.Step(string(payload))
+		msg, err = scramClient.Step(ctx, string(payload))
 		if err != nil {
 			Logger.Println("SASL authentication failed", err)
 			return err
@@ -1476,23 +1548,24 @@ func (b *Broker) sendAndReceiveSASLSCRAMv0() error {
 	return nil
 }
 
-func (b *Broker) sendAndReceiveSASLSCRAMv1(authSendReceiver func(authBytes []byte) (*SaslAuthenticateResponse, error), scramClient SCRAMClient) error {
-	if err := scramClient.Begin(b.conf.Net.SASL.User, b.conf.Net.SASL.Password, b.conf.Net.SASL.SCRAMAuthzID); err != nil {
+func (b *Broker) sendAndReceiveSASLSCRAMv1(authSendReceiver func(authBytes []byte) (*SaslAuthenticateResponse, error), scramClient SCRAMClientWithContext) error {
+	ctx := WithSASLMetadata(context.Background(), &SASLMetadata{Addr: b.addr})
+	if err := scramClient.Begin(ctx, b.conf.Net.SASL.User, b.conf.Net.SASL.Password, b.conf.Net.SASL.SCRAMAuthzID); err != nil {
 		return fmt.Errorf("failed to start SCRAM exchange with the server: %w", err)
 	}
 
-	msg, err := scramClient.Step("")
+	msg, err := scramClient.Step(ctx, "")
 	if err != nil {
 		return fmt.Errorf("failed to advance the SCRAM exchange: %w", err)
 	}
 
-	for !scramClient.Done() {
+	for !scramClient.Done(ctx) {
 		res, err := authSendReceiver([]byte(msg))
 		if err != nil {
 			return err
 		}
 
-		msg, err = scramClient.Step(string(res.SaslAuthBytes))
+		msg, err = scramClient.Step(ctx, string(res.SaslAuthBytes))
 		if err != nil {
 			Logger.Println("SASL authentication failed", err)
 			return err

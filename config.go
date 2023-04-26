@@ -89,7 +89,13 @@ type Config struct {
 			SCRAMAuthzID string
 			// SCRAMClientGeneratorFunc is a generator of a user provided implementation of a SCRAM
 			// client used to perform the SCRAM exchange with the server.
+			//
+			// Deprecated: Use SCRAMClientWithContextGeneratorFunc instead.
 			SCRAMClientGeneratorFunc func() SCRAMClient
+			// SCRAMClientWithContextGeneratorFunc is a generator of a user
+			// provided implementation of a SCRAM client used to perform the
+			// SCRAM exchange with the server.
+			SCRAMClientWithContextGeneratorFunc func() SCRAMClientWithContext
 			// TokenProvider is a user-defined callback for generating
 			// access tokens for SASL/OAUTHBEARER auth. See the
 			// AccessTokenProvider interface docs for proper implementation
@@ -559,6 +565,15 @@ func NewConfig() *Config {
 //
 //nolint:gocyclo // This function's cyclomatic complexity has go beyond 100
 func (c *Config) Validate() error {
+	if c.Net.SASL.SCRAMClientWithContextGeneratorFunc == nil &&
+		c.Net.SASL.SCRAMClientGeneratorFunc != nil {
+		c.Net.SASL.SCRAMClientWithContextGeneratorFunc = func() SCRAMClientWithContext {
+			return &scramClientWithContextWrapper{
+				c.Net.SASL.SCRAMClientGeneratorFunc(),
+			}
+		}
+	}
+
 	// some configuration values should be warned on but not fail completely, do those first
 	if !c.Net.TLS.Enable && c.Net.TLS.Config != nil {
 		Logger.Println("Net.TLS is disabled but a non-nil configuration was provided.")
@@ -642,8 +657,8 @@ func (c *Config) Validate() error {
 			if c.Net.SASL.Password == "" {
 				return ConfigurationError("Net.SASL.Password must not be empty when SASL is enabled")
 			}
-			if c.Net.SASL.SCRAMClientGeneratorFunc == nil {
-				return ConfigurationError("A SCRAMClientGeneratorFunc function must be provided to Net.SASL.SCRAMClientGeneratorFunc")
+			if c.Net.SASL.SCRAMClientWithContextGeneratorFunc == nil {
+				return ConfigurationError("A SCRAMClientWithContextGeneratorFunc function must be provided to Net.SASL.SCRAMClientWithContextGeneratorFunc")
 			}
 		case SASLTypeGSSAPI:
 			if c.Net.SASL.GSSAPI.ServiceName == "" {
@@ -672,10 +687,6 @@ func (c *Config) Validate() error {
 			if c.Net.SASL.GSSAPI.Realm == "" {
 				return ConfigurationError("Net.SASL.GSSAPI.Realm must not be empty when GSS-API mechanism is used")
 			}
-		default:
-			msg := fmt.Sprintf("The SASL mechanism configuration is invalid. Possible values are `%s`, `%s`, `%s`, `%s` and `%s`",
-				SASLTypeOAuth, SASLTypePlaintext, SASLTypeSCRAMSHA256, SASLTypeSCRAMSHA512, SASLTypeGSSAPI)
-			return ConfigurationError(msg)
 		}
 	}
 
