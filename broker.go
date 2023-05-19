@@ -166,9 +166,13 @@ type saslMetadataCtxKey struct{}
 
 // SASLMetadata contains additional data for performing SASL authentication.
 type SASLMetadata struct {
-	// Addr is the address of the broker the authentication will be
+	// Host is the host of the broker the authentication will be
 	// performed on.
-	Addr string
+	Host string
+
+	// Port is the port of the broker the authentication will be
+	// performed on.
+	Port string
 }
 
 // WithSASLMetadata returns a copy of the context with associated SASLMetadata.
@@ -1495,7 +1499,12 @@ func (b *Broker) sendAndReceiveSASLSCRAMv0() error {
 		return err
 	}
 
-	ctx := WithSASLMetadata(context.Background(), &SASLMetadata{Addr: b.addr})
+	host, port, err := net.SplitHostPort(b.addr)
+	if err != nil {
+		return err
+	}
+
+	ctx := WithSASLMetadata(context.Background(), &SASLMetadata{Host: host, Port: port})
 	scramClient := b.conf.Net.SASL.SCRAMClientWithContextGeneratorFunc()
 	if err := scramClient.Begin(ctx, b.conf.Net.SASL.User, b.conf.Net.SASL.Password, b.conf.Net.SASL.SCRAMAuthzID); err != nil {
 		return fmt.Errorf("failed to start SCRAM exchange with the server: %w", err)
@@ -1549,7 +1558,12 @@ func (b *Broker) sendAndReceiveSASLSCRAMv0() error {
 }
 
 func (b *Broker) sendAndReceiveSASLSCRAMv1(authSendReceiver func(authBytes []byte) (*SaslAuthenticateResponse, error), scramClient SCRAMClientWithContext) error {
-	ctx := WithSASLMetadata(context.Background(), &SASLMetadata{Addr: b.addr})
+	host, port, err := net.SplitHostPort(b.addr)
+	if err != nil {
+		return err
+	}
+
+	ctx := WithSASLMetadata(context.Background(), &SASLMetadata{Host: host, Port: port})
 	if err := scramClient.Begin(ctx, b.conf.Net.SASL.User, b.conf.Net.SASL.Password, b.conf.Net.SASL.SCRAMAuthzID); err != nil {
 		return fmt.Errorf("failed to start SCRAM exchange with the server: %w", err)
 	}
